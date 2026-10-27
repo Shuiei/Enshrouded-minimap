@@ -222,6 +222,18 @@ feed from firing before the minimap draws.
 The mod reads these values directly and refreshes them every second while active.
 If the minimap is not loaded yet, start or restart the game after changing it.
 
+## Proton / Wine (this fork)
+
+This fork adds two `minimap_mod` settings in `shroudtopia.json`:
+
+| Setting | Default | Effect |
+|---|---|---|
+| `cursor_check` | `auto` | Hides the minimap while the system cursor is visible. `auto` keeps the check on Windows and skips it under Wine/Proton, where `GetCursorInfo` reports the cursor as visible during normal gameplay. `true` or `false` forces it. |
+| `hud_state_check` | `true` | Hides the minimap until the game's HUD reports the in-game screen. Set `false` only if the minimap never appears; it may then also show over menus. |
+
+While the minimap is hidden, the log gains a `[Minimap] HUD gate diag` line every
+5 seconds and a `system cursor reported visible` line, showing which check blocks it.
+
 ## World clock
 
 The clock appears below the minimap in a bronze frame with matching cyan jewels.

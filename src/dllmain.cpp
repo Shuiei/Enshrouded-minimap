@@ -1561,6 +1561,16 @@ namespace
         return MaxValue(low, MinValue(value, high));
     }
 
+    bool RunningUnderWine()
+    {
+        // Wine and Proton export wine_get_version from ntdll; Windows does not.
+        static const bool underWine = []() noexcept {
+            const HMODULE ntdll = GetModuleHandleW(L"ntdll.dll");
+            return ntdll != nullptr && GetProcAddress(ntdll, "wine_get_version") != nullptr;
+        }();
+        return underWine;
+    }
+
     std::string NormalizeConfigValue(const std::string& value)
     {
         std::string normalized;
@@ -1891,7 +1901,7 @@ namespace
             hudStateCheckSource = "shroudtopia_config_api";
         }
 
-        std::string configuredCursorCheck = "true";
+        std::string configuredCursorCheck = "auto";
         std::string cursorCheckSource = "default";
         if (!TryReadMinimapConfigStringFromFile(modContext, "cursor_check", configuredCursorCheck, cursorCheckSource) &&
             modContext != nullptr && modContext->config.GetString)
@@ -1977,7 +1987,10 @@ namespace
         const bool previousRenderFallback = g_renderCameraFallbackEnabled.exchange(renderFallback);
         const bool previousDebugLogging = g_debugLoggingEnabled.exchange(debugLogging);
         const bool hudStateCheck = ParseConfigBoolean(configuredHudStateCheck, true);
-        const bool cursorCheck = ParseConfigBoolean(configuredCursorCheck, true);
+        // "auto" (default): keep the cursor check on Windows, skip it under Wine/Proton,
+        // where GetCursorInfo reports CURSOR_SHOWING during normal gameplay.
+        const bool cursorCheckAuto = NormalizeConfigValue(configuredCursorCheck) == "auto";
+        const bool cursorCheck = cursorCheckAuto ? !RunningUnderWine() : ParseConfigBoolean(configuredCursorCheck, true);
         const bool previousHudStateCheck = g_hudStateCheckEnabled.exchange(hudStateCheck);
         const bool previousCursorCheck = g_cursorCheckEnabled.exchange(cursorCheck);
         const int previousMapSampleStep = g_minimapMapSampleStep.exchange(mapSampleStep);
@@ -2027,9 +2040,10 @@ namespace
             << " | debug_logging_source=" << debugLoggingSource
             << " | hud_state_check=" << (hudStateCheck ? "on" : "off")
             << " | hud_state_check_source=" << hudStateCheckSource
-            << " | cursor_check=" << (cursorCheck ? "on" : "off")
+            << " | cursor_check=" << (cursorCheck ? "on" : "off") << (cursorCheckAuto ? " (auto)" : "")
+            << " | wine=" << RunningUnderWine()
             << " | cursor_check_source=" << cursorCheckSource
-            << " | fork=proton-hud-diagnostics.1"
+            << " | fork=proton-hud-diagnostics.2"
             << " | map_sample_step=" << mapSampleStep
             << " | map_sample_step_source=" << mapSampleStepSource
             << " | max_icons=" << maxIcons
@@ -2629,6 +2643,8 @@ namespace
         {
             std::ostringstream oss;
             oss << "[Minimap] system cursor reported visible; minimap hidden | flags=" << cursorInfo.flags
+                << " | cursor=" << reinterpret_cast<uintptr_t>(cursorInfo.hCursor)
+                << " | wine=" << RunningUnderWine()
                 << " | blocked=" << g_hudGateDiag.cursorBlocked.load();
             Log(oss.str());
         }
