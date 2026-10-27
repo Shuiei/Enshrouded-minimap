@@ -2043,7 +2043,7 @@ namespace
             << " | cursor_check=" << (cursorCheck ? "on" : "off") << (cursorCheckAuto ? " (auto)" : "")
             << " | wine=" << RunningUnderWine()
             << " | cursor_check_source=" << cursorCheckSource
-            << " | fork=proton-hud-diagnostics.3"
+            << " | fork=proton-hud-diagnostics.4"
             << " | map_sample_step=" << mapSampleStep
             << " | map_sample_step_source=" << mapSampleStepSource
             << " | max_icons=" << maxIcons
@@ -6319,13 +6319,83 @@ namespace
             (snapshot.images.empty() || renderer.images == snapshot.images);
     }
 
+    // Fork fix: when the game created its swapchain before our hooks were
+    // installed, the real extent is unknown. The old fallback used the monitor
+    // size, which in windowed mode places the widget outside the swapchain image
+    // (e.g. 7680x2160 monitor, 4147x2062 game window: nothing visible).
+    // Prefer the game window's client area, which is what the swapchain matches.
+    struct GameWindowSearch { DWORD pid; HWND best; long long area; };
+
+    BOOL CALLBACK FindLargestGameWindow(HWND window, LPARAM parameter)
+    {
+        auto& search = *reinterpret_cast<GameWindowSearch*>(parameter);
+        DWORD pid = 0;
+        GetWindowThreadProcessId(window, &pid);
+        if (pid != search.pid || !IsWindowVisible(window) || IsIconic(window))
+            return TRUE;
+        const LONG_PTR exStyle = GetWindowLongPtrW(window, GWL_EXSTYLE);
+        // Skip overlay-style windows (layered, click-through or tool windows).
+        if ((exStyle & (WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE)) != 0)
+            return TRUE;
+        RECT client{};
+        if (!GetClientRect(window, &client))
+            return TRUE;
+        const long long area = static_cast<long long>(client.right - client.left) * (client.bottom - client.top);
+        if (area > search.area)
+        {
+            search.area = area;
+            search.best = window;
+        }
+        return TRUE;
+    }
+
+    bool TryGetGameWindowClientSize(std::uint32_t& width, std::uint32_t& height)
+    {
+        HWND window = nullptr;
+        const HWND foreground = GetForegroundWindow();
+        DWORD pid = 0;
+        GetWindowThreadProcessId(foreground, &pid);
+        if (foreground != nullptr && pid == GetCurrentProcessId() &&
+            (GetWindowLongPtrW(foreground, GWL_EXSTYLE) & (WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_TOOLWINDOW)) == 0)
+            window = foreground;
+        if (window == nullptr)
+        {
+            GameWindowSearch search{ GetCurrentProcessId(), nullptr, 0 };
+            EnumWindows(&FindLargestGameWindow, reinterpret_cast<LPARAM>(&search));
+            window = search.best;
+        }
+        RECT client{};
+        if (window == nullptr || !GetClientRect(window, &client) ||
+            client.right - client.left <= 0 || client.bottom - client.top <= 0)
+            return false;
+        width = static_cast<std::uint32_t>(client.right - client.left);
+        height = static_cast<std::uint32_t>(client.bottom - client.top);
+        return true;
+    }
+
+    const char* g_rendererExtentSource = "swapchain";
+
     bool BuildVulkanMinimapRendererLocked(const SwapchainRuntimeInfo& snapshot)
     {
-        const std::uint32_t fallbackWidth = static_cast<std::uint32_t>(MaxValue(1, GetSystemMetrics(SM_CXSCREEN)));
-        const std::uint32_t fallbackHeight = static_cast<std::uint32_t>(MaxValue(1, GetSystemMetrics(SM_CYSCREEN)));
+        std::uint32_t fallbackWidth = 0, fallbackHeight = 0;
+        const char* extentSource = "swapchain";
+        if (snapshot.width == 0 || snapshot.height == 0)
+        {
+            if (TryGetGameWindowClientSize(fallbackWidth, fallbackHeight))
+                extentSource = "game_window";
+            else
+            {
+                fallbackWidth = static_cast<std::uint32_t>(MaxValue(1, GetSystemMetrics(SM_CXSCREEN)));
+                fallbackHeight = static_cast<std::uint32_t>(MaxValue(1, GetSystemMetrics(SM_CYSCREEN)));
+                extentSource = "screen";
+            }
+        }
         const std::uint32_t width = snapshot.width != 0 ? snapshot.width : fallbackWidth;
         const std::uint32_t height = snapshot.height != 0 ? snapshot.height : fallbackHeight;
-        const std::uint32_t format = snapshot.format != 0 ? snapshot.format : 37;
+        // Unknown format: under Wine/Proton the game's swapchain was observed as
+        // B8G8R8A8_UNORM (44); keep the original R8G8B8A8_UNORM (37) guess elsewhere.
+        const std::uint32_t format = snapshot.format != 0 ? snapshot.format : (RunningUnderWine() ? 44u : 37u);
+        g_rendererExtentSource = extentSource;
 
         if (RendererMatchesSwapchain(g_renderer, snapshot, width, height, format))
         {
@@ -6480,6 +6550,7 @@ namespace
         oss << "[Minimap] Vulkan minimap renderer ready"
             << " | swapchain=" << Hex(g_renderer.swapchain)
             << " | extent=" << g_renderer.width << "x" << g_renderer.height
+            << " | extent_source=" << g_rendererExtentSource
             << " | colorSpace=" << g_renderer.colorSpace
             << " | format=" << g_renderer.format
             << " | images=" << g_renderer.images.size()
