@@ -29,9 +29,11 @@ jobs:
           New-Item -ItemType Directory -Force -Path $stage | Out-Null
           Copy-Item -Recurse -Path 'assets/*' -Destination $stage
           Copy-Item -Path $dll -Destination $stage
-          Get-ChildItem -Recurse -File dist | ForEach-Object {
-            '{0}  {1}' -f (Get-FileHash $_.FullName -Algorithm SHA256).Hash.ToLowerInvariant(), ($_.FullName.Substring((Resolve-Path dist).Path.Length + 1) -replace '\\','/')
-          } | Out-File dist/SHA256SUMS.txt -Encoding ascii
+          $root = (Resolve-Path dist).Path
+          $sums = @(Get-ChildItem -Recurse -File dist | ForEach-Object {
+            '{0}  {1}' -f (Get-FileHash $_.FullName -Algorithm SHA256).Hash.ToLowerInvariant(), ($_.FullName.Substring($root.Length + 1) -replace '\\','/')
+          })
+          $sums | Out-File dist/SHA256SUMS.txt -Encoding ascii
       - uses: actions/upload-artifact@v4
         with:
           name: minimap_mod-proton-gpu-${{ github.sha }}
