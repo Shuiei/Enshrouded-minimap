@@ -2043,7 +2043,7 @@ namespace
             << " | cursor_check=" << (cursorCheck ? "on" : "off") << (cursorCheckAuto ? " (auto)" : "")
             << " | wine=" << RunningUnderWine()
             << " | cursor_check_source=" << cursorCheckSource
-            << " | fork=proton-hud-diagnostics.2"
+            << " | fork=proton-hud-diagnostics.3"
             << " | map_sample_step=" << mapSampleStep
             << " | map_sample_step_source=" << mapSampleStepSource
             << " | max_icons=" << maxIcons
@@ -9717,6 +9717,19 @@ namespace
         const int cy = ComputeMinimapCenterY(renderer.height, scaled(radius), marginY,
             scaled(showPanel ? clockFooter : frameBottomExtra), scaled(frameTopExtra));
         MinimapScaleScope widgetScale(renderer, scale, cx, cy);
+        {
+            static std::atomic<std::uint64_t> lastWidgetLog{ 0 };
+            const std::uint64_t now = GetTickCount64();
+            std::uint64_t previous = lastWidgetLog.load();
+            if (now - previous >= 10000 && lastWidgetLog.compare_exchange_strong(previous, now))
+            {
+                std::ostringstream oss;
+                oss << "[Minimap] drawing widget | extent=" << renderer.width << "x" << renderer.height
+                    << " | center=" << cx << "," << cy << " | radius=" << scaled(radius)
+                    << " | placement=" << MinimapPlacementName(static_cast<MinimapPlacement>(g_minimapPlacement.load()));
+                Log(oss.str());
+            }
+        }
         const int zoomStep = ClampValue(g_minimapZoomStep.load(), MINIMAP_MIN_ZOOM, MINIMAP_MAX_ZOOM);
         const float zoom = std::pow(1.32f, static_cast<float>(zoomStep));
         const float unitsPerPixel = MINIMAP_BASE_UNITS_PER_PIXEL / zoom;
@@ -10034,10 +10047,30 @@ namespace
         return SubmitVulkanMinimapFrameLocked(queue, info, imageIndex, adjustedInfo, adjustedWaitSemaphore);
     }
 
+    // Wine/Proton does not implement GetAsyncKeyState's "pressed since last call"
+    // bit like Windows: one physical press can report it on several polls, which
+    // toggled the minimap several times per key press. Under Wine, detect presses
+    // from the key-down bit (0x8000) instead, one edge per physical press.
+    bool KeyDownEdge(int key, SHORT (WINAPI* poll)(int))
+    {
+        static std::array<std::atomic<bool>, 256> wasDown{};
+        if (key <= 0 || key > 255)
+            return false;
+        const bool down = (poll(key) & 0x8000) != 0;
+        const bool previous = wasDown[static_cast<std::size_t>(key)].exchange(down);
+        return down && !previous;
+    }
+
     bool MinimapKeyPressed(int primary, int secondary, SHORT (WINAPI* poll)(int) = GetAsyncKeyState)
     {
         // Read both keys without short-circuiting so simultaneous presses do not
         // leave a stale press queued for the following frame.
+        if (RunningUnderWine())
+        {
+            const bool first = KeyDownEdge(primary, poll);
+            const bool second = secondary != primary && KeyDownEdge(secondary, poll);
+            return first || second;
+        }
         const bool first = primary > 0 && (poll(primary) & 1) != 0;
         const bool second = secondary > 0 && secondary != primary && (poll(secondary) & 1) != 0;
         return first || second;
