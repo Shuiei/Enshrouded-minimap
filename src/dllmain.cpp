@@ -20,6 +20,7 @@
 #include <cstring>
 #include <cwchar>
 #include <fstream>
+#include <iomanip>
 #include <mutex>
 #include <memory>
 #include <sstream>
@@ -1280,6 +1281,23 @@ namespace
     std::atomic<std::uint64_t> g_menuVisibilityCallsitePreimageWord{ 0 };
     std::atomic<bool> g_menuVisibilityCallsitePreimageReady{ false };
     std::atomic<std::uint64_t> g_lastMenuVisibilityClosedLogTick{ 0 };
+
+    // Fork addition: counters that show which step of the HUD visibility gate
+    // fails, plus opt-in switches for setups (e.g. Proton) where it never passes.
+    struct HudGateDiagnostics
+    {
+        std::atomic<std::uint64_t> calls{ 0 }, captured{ 0 };
+        std::atomic<std::uint64_t> preRuntime{ 0 }, preOwnership{ 0 }, preScreen{ 0 }, nullOriginal{ 0 };
+        std::atomic<std::uint64_t> postScreen{ 0 }, postContext{ 0 }, postOwnership{ 0 }, postIdentity{ 0 }, postState{ 0 };
+        std::atomic<int> lastScreen{ -1 };
+        std::atomic<std::uint64_t> lastCaptureTick{ 0 };
+        std::atomic<int> ownershipStep{ 0 };
+        std::atomic<std::uint64_t> entry0{ 0 }, entry1{ 0 }, entry2{ 0 };
+        std::atomic<std::uint64_t> cursorBlocked{ 0 }, lastCursorLogTick{ 0 };
+    };
+    HudGateDiagnostics g_hudGateDiag;
+    std::atomic<bool> g_hudStateCheckEnabled{ true };
+    std::atomic<bool> g_cursorCheckEnabled{ true };
     std::atomic<DWORD> g_lastMenuVisibilityRetryTick{ 0 };
     bool g_initialMenuVisibilityPending = false;
 
@@ -1864,6 +1882,24 @@ namespace
             debugLoggingSource = "shroudtopia_config_api";
         }
 
+        std::string configuredHudStateCheck = "true";
+        std::string hudStateCheckSource = "default";
+        if (!TryReadMinimapConfigStringFromFile(modContext, "hud_state_check", configuredHudStateCheck, hudStateCheckSource) &&
+            modContext != nullptr && modContext->config.GetString)
+        {
+            configuredHudStateCheck = modContext->config.GetString("minimap_mod", "hud_state_check", configuredHudStateCheck);
+            hudStateCheckSource = "shroudtopia_config_api";
+        }
+
+        std::string configuredCursorCheck = "true";
+        std::string cursorCheckSource = "default";
+        if (!TryReadMinimapConfigStringFromFile(modContext, "cursor_check", configuredCursorCheck, cursorCheckSource) &&
+            modContext != nullptr && modContext->config.GetString)
+        {
+            configuredCursorCheck = modContext->config.GetString("minimap_mod", "cursor_check", configuredCursorCheck);
+            cursorCheckSource = "shroudtopia_config_api";
+        }
+
         std::string configuredMapSampleStep = "2";
         std::string mapSampleStepSource = "default";
         if (!TryReadMinimapConfigStringFromFile(modContext, "map_sample_step", configuredMapSampleStep, mapSampleStepSource) &&
@@ -1940,6 +1976,10 @@ namespace
         const int previousToggleKey = g_minimapToggleKey.exchange(toggleKey);
         const bool previousRenderFallback = g_renderCameraFallbackEnabled.exchange(renderFallback);
         const bool previousDebugLogging = g_debugLoggingEnabled.exchange(debugLogging);
+        const bool hudStateCheck = ParseConfigBoolean(configuredHudStateCheck, true);
+        const bool cursorCheck = ParseConfigBoolean(configuredCursorCheck, true);
+        const bool previousHudStateCheck = g_hudStateCheckEnabled.exchange(hudStateCheck);
+        const bool previousCursorCheck = g_cursorCheckEnabled.exchange(cursorCheck);
         const int previousMapSampleStep = g_minimapMapSampleStep.exchange(mapSampleStep);
         const int previousMaxIcons = g_minimapMaxDrawnPoints.exchange(maxIcons);
         const bool showPlayers = ReadMarkerVisibility(modContext, "show_other_players");
@@ -1962,6 +2002,7 @@ namespace
             previousToggleKey == toggleKey &&
             previousRenderFallback == renderFallback &&
             previousDebugLogging == debugLogging &&
+            previousHudStateCheck == hudStateCheck && previousCursorCheck == cursorCheck &&
             previousMapSampleStep == mapSampleStep &&
             previousMaxIcons == maxIcons && previousPlayers == showPlayers &&
             previousPings == showPings && previousWaypoints == showWaypoints && previousDeaths == showDeaths && previousClock == showClock && previousWeather == showWeather && previousFog == showFog &&
@@ -1984,6 +2025,11 @@ namespace
             << " | render_camera_fallback_source=" << renderFallbackSource
             << " | debug_logging=" << (debugLogging ? "on" : "off")
             << " | debug_logging_source=" << debugLoggingSource
+            << " | hud_state_check=" << (hudStateCheck ? "on" : "off")
+            << " | hud_state_check_source=" << hudStateCheckSource
+            << " | cursor_check=" << (cursorCheck ? "on" : "off")
+            << " | cursor_check_source=" << cursorCheckSource
+            << " | fork=proton-hud-diagnostics.1"
             << " | map_sample_step=" << mapSampleStep
             << " | map_sample_step_source=" << mapSampleStepSource
             << " | max_icons=" << maxIcons
@@ -2526,6 +2572,8 @@ namespace
     {
         if (!g_client10)
             return true;
+        if (!g_hudStateCheckEnabled.load())
+            return true;
 
         const std::uint64_t now = GetTickCount64();
         if (g_menuVisibilityHookActive.load(std::memory_order_acquire) &&
@@ -2535,7 +2583,55 @@ namespace
         std::uint64_t previous = g_lastMenuVisibilityClosedLogTick.load();
         if (now - previous >= 5000 &&
             g_lastMenuVisibilityClosedLogTick.compare_exchange_strong(previous, now))
+        {
             Log("[Minimap] current HUD state is missing, stale, or outside the verified InGame screen; minimap hidden");
+            const auto& d = g_hudGateDiag;
+            const std::uint64_t lastCapture = d.lastCaptureTick.load();
+            std::ostringstream oss;
+            oss << "[Minimap] HUD gate diag"
+                << " | hook_active=" << g_menuVisibilityHookActive.load()
+                << " | runtime=" << g_runtimeCallbacksActive.load()
+                << " | calls=" << d.calls.load()
+                << " | captured=" << d.captured.load()
+                << " | last_screen=" << d.lastScreen.load()
+                << " | last_capture_age_ms=" << (lastCapture ? static_cast<long long>(now - lastCapture) : -1LL)
+                << " | pre_runtime=" << d.preRuntime.load()
+                << " | pre_ownership=" << d.preOwnership.load()
+                << " | pre_screen=" << d.preScreen.load()
+                << " | null_original=" << d.nullOriginal.load()
+                << " | post_screen=" << d.postScreen.load()
+                << " | post_context=" << d.postContext.load()
+                << " | post_ownership=" << d.postOwnership.load()
+                << " | post_identity=" << d.postIdentity.load()
+                << " | post_state=" << d.postState.load()
+                << " | ownership_step=" << d.ownershipStep.load()
+                << " | renderer_entry=" << std::hex << std::setfill('0')
+                << std::setw(16) << d.entry0.load() << std::setw(16) << d.entry1.load()
+                << std::setw(4) << (d.entry2.load() & 0xffff) << std::dec
+                << " | cursor_blocked=" << d.cursorBlocked.load();
+            Log(oss.str());
+        }
+        return false;
+    }
+
+    bool CursorAllowsMinimapGameplay()
+    {
+        if (!g_cursorCheckEnabled.load())
+            return true;
+        CURSORINFO cursorInfo{};
+        cursorInfo.cbSize = sizeof(cursorInfo);
+        if (!(GetCursorInfo(&cursorInfo) && (cursorInfo.flags & CURSOR_SHOWING) != 0))
+            return true;
+        g_hudGateDiag.cursorBlocked.fetch_add(1);
+        const std::uint64_t now = GetTickCount64();
+        std::uint64_t previous = g_hudGateDiag.lastCursorLogTick.load();
+        if (now - previous >= 5000 && g_hudGateDiag.lastCursorLogTick.compare_exchange_strong(previous, now))
+        {
+            std::ostringstream oss;
+            oss << "[Minimap] system cursor reported visible; minimap hidden | flags=" << cursorInfo.flags
+                << " | blocked=" << g_hudGateDiag.cursorBlocked.load();
+            Log(oss.str());
+        }
         return false;
     }
 
@@ -2543,18 +2639,14 @@ namespace
     {
         if (!g_minimapVisible.load() || !CurrentProfileAllowsMinimapGameplay())
             return false;
-        CURSORINFO cursorInfo{};
-        cursorInfo.cbSize = sizeof(cursorInfo);
-        return !(GetCursorInfo(&cursorInfo) && (cursorInfo.flags & CURSOR_SHOWING) != 0);
+        return CursorAllowsMinimapGameplay();
     }
 
     bool IsMinimapGameplay()
     {
         if (!CurrentProfileAllowsMinimapGameplay())
             return false;
-        CURSORINFO cursorInfo{};
-        cursorInfo.cbSize = sizeof(cursorInfo);
-        if (GetCursorInfo(&cursorInfo) && (cursorInfo.flags & CURSOR_SHOWING) != 0)
+        if (!CursorAllowsMinimapGameplay())
             return false;
 
         return HasFreshPlayerPosition();
@@ -3502,16 +3594,26 @@ namespace
         if (!g_exeBase || g_exeImageSize <= ClientRva(RVA_MENU_RENDERER_CALL_1_0) + 10 ||
             g_exeImageSize <= ClientRva(MinimapMenu10::RendererRva) + 18 ||
             !PublicCreativeCompat::Range(g_exeBase, g_exeImageSize))
+        {
+            g_hudGateDiag.ownershipStep.store(1);
             return false;
+        }
 
         std::uint8_t callPrefix[5]{};
         const std::uint8_t* ownedCall = nullptr;
         if (retained)
         {
-            if (!IsRetainedCurrentMenuCallsiteOwned(g_menuVisibilityCallHook) ||
-                !MakeDirectCallOpcode(g_exeBase + ClientRva(RVA_MENU_RENDERER_CALL_1_0),
-                    g_exeBase + ClientRva(MinimapMenu10::RendererRva), callPrefix))
+            if (!IsRetainedCurrentMenuCallsiteOwned(g_menuVisibilityCallHook))
+            {
+                g_hudGateDiag.ownershipStep.store(2);
                 return false;
+            }
+            if (!MakeDirectCallOpcode(g_exeBase + ClientRva(RVA_MENU_RENDERER_CALL_1_0),
+                    g_exeBase + ClientRva(MinimapMenu10::RendererRva), callPrefix))
+            {
+                g_hudGateDiag.ownershipStep.store(3);
+                return false;
+            }
             ownedCall = callPrefix;
         }
         const auto guards = [&](const std::uint8_t* prefix, std::size_t size)
@@ -3523,7 +3625,18 @@ namespace
         std::array<std::uint8_t, 18> entry{};
         if (!PublicCreativeCompat::Copy(g_exeBase + ClientRva(MinimapMenu10::RendererRva),
             entry.data(), entry.size(), true))
+        {
+            g_hudGateDiag.ownershipStep.store(4);
             return false;
+        }
+        {
+            std::uint64_t words[3]{};
+            for (std::size_t i = 0; i < entry.size(); ++i)
+                words[i / 8] = (words[i / 8] << 8) | entry[i];
+            g_hudGateDiag.entry0.store(words[0]);
+            g_hudGateDiag.entry1.store(words[1]);
+            g_hudGateDiag.entry2.store(words[2]);
+        }
         if (guards(nullptr, 0))
         {
             PublicCreativeCompat::ForgetIdentity();
@@ -3542,6 +3655,7 @@ namespace
             sample.identity = publicProof.digest;
             return true;
         }
+        g_hudGateDiag.ownershipStep.store(5);
         return false;
     }
 
@@ -3686,10 +3800,15 @@ namespace
         MenuOwnershipSample before{};
         std::array<uintptr_t, 4> contextBefore{};
         std::uint8_t initialScreen = 0;
-        const bool staged = g_client10 && g_runtimeCallbacksActive.load(std::memory_order_acquire) &&
-            g_menuVisibilityHookActive.load(std::memory_order_acquire) &&
-            SampleCurrentMenuOwnership(before, true, PublicCreativeCompat::ProofOrigin::CallbackPre) &&
-            TryReadCurrentHudScreenType(initialScreen, &contextBefore);
+        g_hudGateDiag.calls.fetch_add(1);
+        const bool runtimeReady = g_client10 && g_runtimeCallbacksActive.load(std::memory_order_acquire) &&
+            g_menuVisibilityHookActive.load(std::memory_order_acquire);
+        const bool ownedBefore = runtimeReady &&
+            SampleCurrentMenuOwnership(before, true, PublicCreativeCompat::ProofOrigin::CallbackPre);
+        const bool staged = ownedBefore && TryReadCurrentHudScreenType(initialScreen, &contextBefore);
+        if (!runtimeReady) g_hudGateDiag.preRuntime.fetch_add(1);
+        else if (!ownedBefore) g_hudGateDiag.preOwnership.fetch_add(1);
+        else if (!staged) g_hudGateDiag.preScreen.fetch_add(1);
         const bool preservePriorGameplay = staged && initialScreen == 1 &&
             g_menuVisibilitySnapshot.AllowsGameplay(GetTickCount64());
         if (!preservePriorGameplay)
@@ -3699,6 +3818,7 @@ namespace
             g_originalMenuRenderer.load(std::memory_order_acquire));
         if (original == nullptr)
         {
+            g_hudGateDiag.nullOriginal.fetch_add(1);
             g_menuVisibilitySnapshot.Clear();
             wrapper.NullOriginalExit();
             return;
@@ -3718,17 +3838,29 @@ namespace
         std::uint8_t screen = 0;
         std::array<uintptr_t, 4> contextAfter{};
         MenuOwnershipSample after{};
-        if (!TryReadCurrentHudScreenType(screen, &contextAfter) || contextBefore != contextAfter ||
-            !SampleCurrentMenuOwnership(after, true, PublicCreativeCompat::ProofOrigin::CallbackPost) || before.kind != after.kind ||
-            before.identity != after.identity ||
-            epoch != g_menuVisibilityCaptureEpoch.load(std::memory_order_acquire) ||
+        std::atomic<std::uint64_t>* postFailure = nullptr;
+        if (!TryReadCurrentHudScreenType(screen, &contextAfter))
+            postFailure = &g_hudGateDiag.postScreen;
+        else if (contextBefore != contextAfter)
+            postFailure = &g_hudGateDiag.postContext;
+        else if (!SampleCurrentMenuOwnership(after, true, PublicCreativeCompat::ProofOrigin::CallbackPost))
+            postFailure = &g_hudGateDiag.postOwnership;
+        else if (before.kind != after.kind || before.identity != after.identity)
+            postFailure = &g_hudGateDiag.postIdentity;
+        else if (epoch != g_menuVisibilityCaptureEpoch.load(std::memory_order_acquire) ||
             !g_client10 || !g_runtimeCallbacksActive.load(std::memory_order_acquire) ||
             !g_menuVisibilityHookActive.load(std::memory_order_acquire))
+            postFailure = &g_hudGateDiag.postState;
+        if (postFailure != nullptr)
         {
+            postFailure->fetch_add(1);
             g_menuVisibilitySnapshot.Clear();
             return;
         }
 
+        g_hudGateDiag.captured.fetch_add(1);
+        g_hudGateDiag.lastScreen.store(screen);
+        g_hudGateDiag.lastCaptureTick.store(GetTickCount64());
         g_menuVisibilitySnapshot.Capture(screen, GetTickCount64(), true);
         if (epoch != g_menuVisibilityCaptureEpoch.load(std::memory_order_acquire) ||
             !g_client10 || !g_runtimeCallbacksActive.load(std::memory_order_acquire) ||

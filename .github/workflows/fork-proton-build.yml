@@ -1,0 +1,36 @@
+name: Fork build (Proton HUD diagnostics)
+
+# Plain compile of minimap_mod.dll for this fork. The upstream release workflow
+# pins the exact accepted source tree, so it rejects any modified source; this
+# workflow only builds and uploads the DLL for testing.
+
+on:
+  push:
+    branches: [proton-hud-diagnostics]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v4
+      - uses: microsoft/setup-msbuild@v2
+      - name: Build minimap_mod.dll (Release x64)
+        shell: pwsh
+        run: |
+          msbuild ./minimap_mod.vcxproj /t:Rebuild /p:Configuration=Release /p:Platform=x64 /p:PlatformToolset=v143 /m /nologo
+          if ($LASTEXITCODE) { throw 'Build failed' }
+          $dll = 'build/x64/Release/mods/minimap_mod.dll'
+          if (-not (Test-Path $dll)) { throw "Missing $dll" }
+          (Get-FileHash $dll -Algorithm SHA256).Hash.ToLowerInvariant() + '  minimap_mod.dll' | Out-File build/x64/Release/mods/minimap_mod.dll.sha256 -Encoding ascii
+      - uses: actions/upload-artifact@v4
+        with:
+          name: minimap_mod-proton-hud-diagnostics-${{ github.sha }}
+          path: |
+            build/x64/Release/mods/minimap_mod.dll
+            build/x64/Release/mods/minimap_mod.dll.sha256
+          if-no-files-found: error
+          retention-days: 30
