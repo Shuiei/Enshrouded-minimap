@@ -1,0 +1,40 @@
+name: Fork build (0.5.16 GPU + Proton fixes)
+
+# Plain compile of minimap_mod.dll for this fork, packaged with the branch's
+# runtime assets as mods/minimap_mod. The upstream workflows pin the exact
+# accepted sources and only run on main; this one only builds for testing.
+
+on:
+  push:
+    branches: [proton-gpu]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v4
+      - uses: microsoft/setup-msbuild@v2
+      - name: Build minimap_mod.dll (Release x64) and stage mods/minimap_mod
+        shell: pwsh
+        run: |
+          msbuild ./minimap_mod.vcxproj /t:Rebuild /p:Configuration=Release /p:Platform=x64 /p:PlatformToolset=v143 /m /nologo
+          if ($LASTEXITCODE) { throw 'Build failed' }
+          $dll = 'build/x64/Release/mods/minimap_mod.dll'
+          if (-not (Test-Path $dll)) { throw "Missing $dll" }
+          $stage = 'dist/mods/minimap_mod'
+          New-Item -ItemType Directory -Force -Path $stage | Out-Null
+          Copy-Item -Recurse -Path 'assets/*' -Destination $stage
+          Copy-Item -Path $dll -Destination $stage
+          Get-ChildItem -Recurse -File dist | ForEach-Object {
+            '{0}  {1}' -f (Get-FileHash $_.FullName -Algorithm SHA256).Hash.ToLowerInvariant(), ($_.FullName.Substring((Resolve-Path dist).Path.Length + 1) -replace '\\','/')
+          } | Out-File dist/SHA256SUMS.txt -Encoding ascii
+      - uses: actions/upload-artifact@v4
+        with:
+          name: minimap_mod-proton-gpu-${{ github.sha }}
+          path: dist/
+          if-no-files-found: error
+          retention-days: 30

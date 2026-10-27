@@ -1632,6 +1632,7 @@ namespace
     std::atomic<int> g_minimapZoomOutKey{ VK_OEM_MINUS }, g_minimapZoomOutSecondary{ VK_SUBTRACT };
     std::atomic<bool> g_renderCameraFallbackEnabled{ true };
     std::atomic<bool> g_debugLoggingEnabled{ false };
+    std::atomic<bool> g_cursorCheckEnabled{ true };
     std::atomic<bool> g_showOtherPlayers{ true };
     std::atomic<bool> g_showPings{ true };
     std::atomic<bool> g_showWaypoints{ true };
@@ -1740,6 +1741,62 @@ namespace
     T ClampValue(T value, T low, T high)
     {
         return MaxValue(low, MinValue(value, high));
+    }
+
+    // Fork (Proton): Wine and Proton export wine_get_version from ntdll; Windows does not.
+    bool RunningUnderWine()
+    {
+        static const bool underWine = []() noexcept {
+            const HMODULE ntdll = GetModuleHandleW(L"ntdll.dll");
+            return ntdll != nullptr && GetProcAddress(ntdll, "wine_get_version") != nullptr;
+        }();
+        return underWine;
+    }
+
+    struct GameWindowSearch { DWORD pid; HWND best; long long area; };
+
+    BOOL CALLBACK FindLargestGameWindow(HWND window, LPARAM parameter)
+    {
+        auto& search = *reinterpret_cast<GameWindowSearch*>(parameter);
+        DWORD pid = 0;
+        GetWindowThreadProcessId(window, &pid);
+        if (pid != search.pid || !IsWindowVisible(window) || IsIconic(window))
+            return TRUE;
+        const LONG_PTR exStyle = GetWindowLongPtrW(window, GWL_EXSTYLE);
+        if ((exStyle & (WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE)) != 0)
+            return TRUE;
+        RECT client{};
+        if (!GetClientRect(window, &client))
+            return TRUE;
+        const long long area = static_cast<long long>(client.right - client.left) * (client.bottom - client.top);
+        if (area > search.area) { search.area = area; search.best = window; }
+        return TRUE;
+    }
+
+    // Client size of the game's window (foreground window of this process, else
+    // its largest non-overlay window). The swapchain matches this in windowed mode.
+    bool TryGetGameWindowClientSize(std::uint32_t& width, std::uint32_t& height)
+    {
+        HWND window = nullptr;
+        const HWND foreground = GetForegroundWindow();
+        DWORD pid = 0;
+        GetWindowThreadProcessId(foreground, &pid);
+        if (foreground != nullptr && pid == GetCurrentProcessId() &&
+            (GetWindowLongPtrW(foreground, GWL_EXSTYLE) & (WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_TOOLWINDOW)) == 0)
+            window = foreground;
+        if (window == nullptr)
+        {
+            GameWindowSearch search{ GetCurrentProcessId(), nullptr, 0 };
+            EnumWindows(&FindLargestGameWindow, reinterpret_cast<LPARAM>(&search));
+            window = search.best;
+        }
+        RECT client{};
+        if (window == nullptr || !GetClientRect(window, &client) ||
+            client.right - client.left <= 0 || client.bottom - client.top <= 0)
+            return false;
+        width = static_cast<std::uint32_t>(client.right - client.left);
+        height = static_cast<std::uint32_t>(client.bottom - client.top);
+        return true;
     }
 
     std::string NormalizeConfigValue(const std::string& value)
@@ -2149,6 +2206,15 @@ namespace
             debugLoggingSource = "shroudtopia_config_api";
         }
 
+        std::string configuredCursorCheck = "auto";
+        std::string cursorCheckSource = "default";
+        if (!TryReadMinimapConfigStringFromFile(modContext, "cursor_check", configuredCursorCheck, cursorCheckSource) &&
+            modContext != nullptr && modContext->config.GetString)
+        {
+            configuredCursorCheck = modContext->config.GetString("minimap_mod", "cursor_check", configuredCursorCheck);
+            cursorCheckSource = "shroudtopia_config_api";
+        }
+
         std::string configuredMapSampleStep = "2";
         std::string mapSampleStepSource = "default";
         if (!TryReadMinimapConfigStringFromFile(modContext, "map_sample_step", configuredMapSampleStep, mapSampleStepSource) &&
@@ -2264,6 +2330,11 @@ namespace
         const int previousToggleKey = g_minimapToggleKey.exchange(toggleKey);
         const bool previousRenderFallback = g_renderCameraFallbackEnabled.exchange(renderFallback);
         const bool previousDebugLogging = g_debugLoggingEnabled.exchange(debugLogging);
+        // "auto": keep the cursor check on Windows; skip it under Wine/Proton, where
+        // GetCursorInfo reports CURSOR_SHOWING during normal gameplay.
+        const bool cursorCheckAuto = NormalizeConfigValue(configuredCursorCheck) == "auto";
+        const bool cursorCheck = cursorCheckAuto ? !RunningUnderWine() : ParseConfigBoolean(configuredCursorCheck, true);
+        const bool previousCursorCheck = g_cursorCheckEnabled.exchange(cursorCheck);
         const bool previousPlayerArrowGlow = g_playerArrowGlowEnabled.exchange(playerArrowGlow);
         if (!previousPlayerArrowGlow && playerArrowGlow)
             g_playerArrowGlowEnableEpoch.fetch_add(1);
@@ -2298,6 +2369,7 @@ namespace
             previousToggleKey == toggleKey &&
             previousRenderFallback == renderFallback &&
             previousDebugLogging == debugLogging &&
+            previousCursorCheck == cursorCheck &&
             previousMapSampleStep == mapSampleStep &&
             previousMaxIcons == maxIcons && previousPlayerArrowGlow == playerArrowGlow &&
             previousPlayerArrowGlowStyle == static_cast<int>(playerArrowGlowStyle) &&
@@ -2326,6 +2398,10 @@ namespace
             << " | render_camera_fallback_source=" << renderFallbackSource
             << " | debug_logging=" << (debugLogging ? "on" : "off")
             << " | debug_logging_source=" << debugLoggingSource
+            << " | cursor_check=" << (cursorCheck ? "on" : "off") << (cursorCheckAuto ? " (auto)" : "")
+            << " | cursor_check_source=" << cursorCheckSource
+            << " | wine=" << RunningUnderWine()
+            << " | fork=proton-gpu.1"
             << " | map_sample_step=" << mapSampleStep
             << " | map_sample_step_source=" << mapSampleStepSource
             << " | max_icons=" << maxIcons
@@ -2942,7 +3018,7 @@ namespace
             CURSORINFO cursorInfo{};
             cursorInfo.cbSize = sizeof(cursorInfo);
             const bool cursorRead = GetCursorInfo(&cursorInfo) != FALSE;
-            const bool cursorShowing = cursorRead && (cursorInfo.flags & CURSOR_SHOWING) != 0;
+            const bool cursorShowing = g_cursorCheckEnabled.load() && cursorRead && (cursorInfo.flags & CURSOR_SHOWING) != 0;
             MinimapPresentDecision::CaptureCursor(*observation, cursorRead, cursorShowing);
             const bool allowed = !cursorShowing;
             observation->admitted = MinimapPresentDecision::Observe(allowed);
@@ -2953,7 +3029,7 @@ namespace
             return false;
         CURSORINFO cursorInfo{};
         cursorInfo.cbSize = sizeof(cursorInfo);
-        return !(GetCursorInfo(&cursorInfo) && (cursorInfo.flags & CURSOR_SHOWING) != 0);
+        return !g_cursorCheckEnabled.load() || !(GetCursorInfo(&cursorInfo) && (cursorInfo.flags & CURSOR_SHOWING) != 0);
     }
 
     bool IsMinimapGameplay(
@@ -2970,7 +3046,7 @@ namespace
             CURSORINFO cursorInfo{};
             cursorInfo.cbSize = sizeof(cursorInfo);
             const bool cursorRead = GetCursorInfo(&cursorInfo) != FALSE;
-            const bool cursorShowing = cursorRead && (cursorInfo.flags & CURSOR_SHOWING) != 0;
+            const bool cursorShowing = g_cursorCheckEnabled.load() && cursorRead && (cursorInfo.flags & CURSOR_SHOWING) != 0;
             MinimapPresentDecision::CaptureCursor(*observation, cursorRead, cursorShowing);
             if (cursorShowing)
             {
@@ -2988,7 +3064,7 @@ namespace
             return false;
         CURSORINFO cursorInfo{};
         cursorInfo.cbSize = sizeof(cursorInfo);
-        if (GetCursorInfo(&cursorInfo) && (cursorInfo.flags & CURSOR_SHOWING) != 0)
+        if (g_cursorCheckEnabled.load() && GetCursorInfo(&cursorInfo) && (cursorInfo.flags & CURSOR_SHOWING) != 0)
             return false;
 
         return HasFreshPlayerPosition();
@@ -6780,6 +6856,45 @@ namespace
             snapshot.createDevice == snapshot.device && snapshot.createHandle == snapshot.handle &&
             snapshot.createGeneration == snapshot.generation && snapshot.format != 0 &&
             snapshot.width != 0 && snapshot.height != 0;
+    }
+
+    // Fork (Proton): Shroudtopia starts mods seconds after the game created its
+    // swapchain, so the create is never observed and this build would never draw.
+    // Under Wine only, describe the presented swapchain from the game window's
+    // client size and the format observed for it (B8G8R8A8_UNORM). An observed
+    // create (e.g. after a window resize) always takes precedence.
+    bool TrySynthesizeWineSwapchainSnapshot(uintptr_t swapchain, SwapchainRuntimeInfo& snapshot)
+    {
+        if (!RunningUnderWine() || swapchain == 0)
+            return false;
+        const uintptr_t device = g_lastVulkanDevice.load();
+        std::uint32_t width = 0, height = 0;
+        if (device == 0 || !TryGetGameWindowClientSize(width, height))
+            return false;
+        if (snapshot.handle != swapchain)
+            snapshot = {};
+        snapshot.handle = swapchain;
+        snapshot.device = device;
+        if (snapshot.generation == 0)
+            snapshot.generation = 1;
+        snapshot.createDevice = device;
+        snapshot.createHandle = swapchain;
+        snapshot.createGeneration = snapshot.generation;
+        if (snapshot.format == 0)
+            snapshot.format = 44;
+        snapshot.width = width;
+        snapshot.height = height;
+        static std::atomic<std::uint64_t> lastLog{ 0 };
+        const std::uint64_t now = GetTickCount64();
+        std::uint64_t previous = lastLog.load();
+        if (now - previous >= 30000 && lastLog.compare_exchange_strong(previous, now))
+        {
+            std::ostringstream oss;
+            oss << "[Minimap] swapchain create not observed; Wine fallback | extent=" << width << "x" << height
+                << " | format=" << snapshot.format;
+            Log(oss.str());
+        }
+        return true;
     }
 
     bool RendererMatchesSwapchain(const VulkanMinimapRenderer& renderer,
@@ -11831,7 +11946,9 @@ namespace
             return false;
 
         SwapchainRuntimeInfo snapshot{};
-        const bool snapshotKnown = TryGetSwapchainSnapshot(firstSwapchain, snapshot);
+        bool snapshotKnown = TryGetSwapchainSnapshot(firstSwapchain, snapshot);
+        if (!HasObservedSwapchainCreate(snapshot) && TrySynthesizeWineSwapchainSnapshot(firstSwapchain, snapshot))
+            snapshotKnown = true;
         MINIMAP_PD_TRACE_IF(trace,
             trace->snapshotKnown = MinimapPresentDecision::Observe(snapshotKnown));
         if (!MINIMAP_PD_GATE(trace, MinimapPresentDecision::Rejection::SnapshotUnknown, snapshotKnown))
@@ -11929,10 +12046,29 @@ namespace
             adjustedWaitSemaphore, shouldDraw MINIMAP_PD_TRACE_ARG(trace));
     }
 
+    // Fork (Proton): Wine reports GetAsyncKeyState's "pressed since last call" bit
+    // on several polls for one press, toggling the minimap several times. Under
+    // Wine, use the key-down bit (0x8000) and fire once per physical press.
+    bool KeyDownEdge(int key, SHORT (WINAPI* poll)(int))
+    {
+        static std::array<std::atomic<bool>, 256> wasDown{};
+        if (key <= 0 || key > 255)
+            return false;
+        const bool down = (poll(key) & 0x8000) != 0;
+        const bool previous = wasDown[static_cast<std::size_t>(key)].exchange(down);
+        return down && !previous;
+    }
+
     bool MinimapKeyPressed(int primary, int secondary, SHORT (WINAPI* poll)(int) = GetAsyncKeyState)
     {
         // Read both keys without short-circuiting so simultaneous presses do not
         // leave a stale press queued for the following frame.
+        if (RunningUnderWine())
+        {
+            const bool firstEdge = KeyDownEdge(primary, poll);
+            const bool secondEdge = secondary != primary && KeyDownEdge(secondary, poll);
+            return firstEdge || secondEdge;
+        }
         const bool first = primary > 0 && (poll(primary) & 1) != 0;
         const bool second = secondary > 0 && secondary != primary && (poll(secondary) & 1) != 0;
         return first || second;
